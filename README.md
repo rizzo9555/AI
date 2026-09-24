@@ -11,9 +11,8 @@ Step-by-step guide to reinstall all AI-related services on a fresh Ubuntu setup.
 | GPU | GeForce RTX 4080 SUPER 16GB |
 | Motherboard | Aorus X570 Elite |
 | OS Drive | Samsung SSD 990 PRO 2TB (500GB Ubuntu / 1.3TB Windows / 200GB Bazzite) |
-| Games Drive | Samsung SSD 970 EVO 500GB |
 
-> This guide targets the **Ubuntu** partition (500GB).
+> This guide targets the **Ubuntu** partition (500GB). Ubuntu 26.04 LTS ("resolute") ships only Python 3.14 by default — see Section 7.1 for why a second Python version is needed for CrewAI.
 
 ---
 
@@ -307,6 +306,8 @@ memory = Memory.from_config(config_dict=config)
 
 > `embedding_model_dims: 768` matches `nomic-embed-text`'s output size — Mem0's Qdrant default (1536) is sized for OpenAI embeddings and must be overridden or `add`/`search` will fail with a dimension mismatch.
 
+> **Important — Qdrant is running in local/embedded mode, not as a server.** Because `vector_store.config` uses `path` (not `host`/`port`), Qdrant has no separate process — it's a set of files on disk that Python opens directly. This means **only one process can have it open at a time**. Don't run a Mem0 standalone script and the CrewAI integration (Section 7) at the same time — one will fail to open the locked files.
+
 ### 5.6 Test
 
 ```python
@@ -335,7 +336,7 @@ python test_mem0.py
 
 Verify the graph side by opening `http://localhost:7474` and running `MATCH (n) RETURN n LIMIT 25;` — connected nodes confirm Graph Memory is writing correctly.
 
-> Note: `search()` requires `user_id` inside `filters={}` — passing it as a top-level kwarg (as `add()` still accepts) raises a `ValueError` on current versions.
+> Note: `search()`/`get_all()` require `user_id` inside `filters={}` — passing it as a top-level kwarg (as `add()`/`delete_all()` still accept) raises a `ValueError` on current versions. This applies across `mem0ai` 2.x releases, at least down to `2.0.14`.
 
 ---
 
@@ -360,13 +361,83 @@ ai-agents/mem0/qdrant_data/
 
 ---
 
+## 7. CrewAI ↔ Mem0 Integration (venv, manual tool)
+
+Gives a CrewAI agent access to the Mem0 memory set up in Section 5, so it can recall facts/preferences across runs. **CrewAI has no built-in native support for a `"provider": "mem0"` memory backend** — confirmed by grepping the entire installed `crewai`/`crewai-core` source (version 1.15.22) for the string `"mem0"`: zero matches outside the `mem0` package itself. A `memory_config={"provider": "mem0", ...}` is silently ignored by this CrewAI version; it falls back to its own default (ChromaDB-based) memory, which then fails due to the `posthog`/`chromadb` version conflict noted in 7.4. Integration here is done manually instead, via a custom Tool.
+
+### 7.1 Create the venv (separate from Mem0's) with Python 3.12
+
+Ubuntu 26.04 ships only Python 3.14 by default, which lacks pre-built wheels for several CrewAI dependencies (e.g. `tiktoken`, which requires a Rust compiler to build from source on 3.14). Python 3.12 is used instead, installed via the Deadsnakes PPA:
+
+```bash
+sudo apt install software-properties-common
+sudo add-apt-repository ppa:deadsnakes/ppa -y
+sudo apt update
+sudo apt install python3.12 python3.12-venv
+```
+
+Then create the venv:
+
+```bash
+mkdir -p ~/Projects/AI/ai-agents/crewai && cd ~/Projects/AI/ai-agents/crewai
+python3.12 -m venv venv
+source venv/bin/activate
+```
+
+### 7.2 Install dependencies
+
+Install in separate steps (installing everything in one `pip install` line can trigger a `resolution-too-deep` error — CrewAI's dependency tree, combined with `langchain-neo4j`, is too complex for pip to solve in one pass):
+
+```bash
+pip install --upgrade pip setuptools wheel
+pip install crewai
+pip install mem0ai==2.0.14
+pip install python-dotenv
+pip install neo4j
+pip install langchain-neo4j
+```
+
+> `mem0ai` is pinned to `2.0.14` here for stability, though this pin turned out not to be the fix for the integration issue (see 7.4) — the `mem0` library itself works fine with any recent 2.x version, as long as `search()`/`get_all()` calls use `filters={"user_id": ...}` (see Section 5.6's note).
+
+`mem0ai` also requires its own `.env` with `NEO4J_PASSWORD` — same value as Section 5.4, copy `~/Projects/AI/ai-agents/mem0/.env` or create a fresh one in the `crewai` folder.
+
+### 7.3 The integration script
+
+`~/Projects/AI/ai-agents/crewai/crewai_mem0_example.py` — a minimal working example. Key points:
+
+- `memory=False` on the `Crew` — disables CrewAI's own (broken) default memory system.
+- A custom `BaseTool` (`buscar_memoria`) that the agent calls explicitly to search Mem0 (`mem0_client.search(query, filters={"user_id": USER_ID}, limit=5)`).
+- A `salvar_memoria()` helper function, called manually after each `crew.kickoff()`, that writes the turn to Mem0 (`mem0_client.add(..., user_id=USER_ID)`).
+- The agent's LLM must be set **explicitly** to Ollama — `memory_config`/Mem0 setup has no effect on which LLM the *agent* itself uses to reason. Without this, CrewAI defaults to OpenAI and fails with `OPENAI_API_KEY is required`:
+
+```python
+from crewai import LLM
+ollama_llm = LLM(model="ollama/qwen3:14b", base_url="http://localhost:11434")
+# ...
+agent = Agent(..., llm=ollama_llm, tools=[BuscarMemoriaTool()])
+```
+
+Full script kept alongside this README, in the same folder.
+
+### 7.4 Troubleshooting notes (from setting this up)
+
+- **`resolution-too-deep` on `pip install`**: install packages one at a time (Section 7.2), not all in one command.
+- **`tiktoken` build fails needing a Rust compiler**: symptom of running on Python 3.14; switch to 3.12 (Section 7.1) rather than installing Rust.
+- **Duplicated `(venv)` in the shell prompt** (e.g. `((venv) )`, `(venv) (venv)`): a known quirk when a venv is activated on top of another already-active one, or after a broken attempt to customize `PS1`. It's purely cosmetic (confirmed via `$VIRTUAL_ENV` and `which python3` — the correct interpreter is always used), but if it's distracting, the reliable fix is closing the terminal application entirely and opening a new one, then activating the venv once.
+- **`OPENAI_API_KEY is required`**: the agent's `llm=` wasn't set explicitly — see Section 7.3.
+- **`chromadb` requires `posthog<6.0.0`, but `mem0ai` installs `posthog>=7.x`**: a real, unresolved dependency conflict between CrewAI's default memory backend (ChromaDB) and Mem0. Not an issue for this integration since `memory=False` avoids ChromaDB entirely, but would need resolving if CrewAI's default memory is ever used alongside Mem0 in the same venv.
+- **`memory_save_failed` warning with "empty scope stack"**: misleading — this came from CrewAI's default (ChromaDB) memory failing silently in the background (see `posthog` conflict above), not from Mem0. It disappeared once `memory=False` + the manual tool approach (Section 7.3) replaced the native `memory_config`.
+- **Qdrant appears to not be running (`docker ps` doesn't show it, nothing on port 6333)**: expected — it's running in local/embedded mode (Section 5.6), not as a server.
+
+---
+
 ## Pending / To Investigate
 
 - [ ] **"Coding" agent (remote terminal assistant)** — e.g. Letta's App Server / Letta Code (shell + filesystem access, Telegram/Slack integration). Confirmed free/local capable (no paid plan required for self-hosted runtime). Not yet installed — placeholder for future steps once evaluated.
-- [ ] **CrewAI — RAG/context management** — no native integration available; must be manually delegated to a dedicated tool/agent role within the crew.
 - [ ] **Mem0 — Docker server option (deferred)** — official Docker bundle only supports OpenAI/Anthropic/Gemini out of the box (no native Ollama support). Would require modifying `server/main.py` and rebuilding the image to add Ollama — deferred for now in favor of the venv/library setup in Section 5; revisit if the dashboard/API becomes worth the maintenance overhead of a custom fork.
 - [ ] **Mem0 — optional extras**: `spaCy` (`pip install "mem0ai[nlp]"`) for more refined entity extraction; `fastembed` (`pip install "mem0ai[extras]"`) to enable BM25 keyword search alongside semantic search.
-- [ ] **CrewAI ↔ Mem0 integration** — wire up `config.py`'s `memory` object as a tool/memory source for a CrewAI agent (next step).
+- [ ] **`chromadb`/`posthog` version conflict** (Section 7.4) — unresolved; currently sidestepped by not using CrewAI's default memory, not actually fixed.
+- [ ] **Paperclip agent manager** — install and configure; will also be used in the future "Get Contractors Now" project.
 
 ## Notes
 
@@ -375,3 +446,4 @@ ai-agents/mem0/qdrant_data/
 - Update Section 3 if additional Docker containers (vector databases, n8n, etc.) are introduced later.
 - Ollama is intentionally kept native, not dockerized — see the note at the top of Section 3.
 - Section 3.5 (remote access) is a placeholder until that setup is actually done.
+- Section 7 (CrewAI) runs in its own venv, separate from Mem0's (Section 5) — the two must never have the local Qdrant data open at the same time (see the note in 5.6).
