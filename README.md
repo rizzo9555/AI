@@ -196,6 +196,178 @@ The first account created at `http://localhost:8080` becomes the admin automatic
 
 ---
 
+## 5. Mem0 — Agent Memory Layer (venv, Graph Memory)
+
+Gives agents (starting with CrewAI) persistent memory: a vector store (Qdrant, embedded/local) for semantic recall plus a graph store (Neo4j) for entity/relationship memory. Runs as a Python library inside a dedicated venv — not the official Docker server bundle, since that bundle only supports OpenAI/Anthropic/Gemini out of the box (see Pending list below). Fully local via Ollama.
+
+### 5.1 Create the venv and install Mem0
+
+```bash
+mkdir -p ~/Projects/AI/ai-agents/mem0 && cd ~/Projects/AI/ai-agents/mem0
+python3 -m venv venv-mem0
+source venv-mem0/bin/activate
+pip install mem0ai ollama neo4j langchain-neo4j python-dotenv
+```
+
+> Note: as of `mem0ai` 2.2.0, the `[graph]` install extra was dropped — the `neo4j`/`langchain-neo4j` packages must be installed manually, as above. The `ollama` package (official Python client) is also required separately for the Ollama embedder to work.
+
+### 5.2 Run Neo4j locally (Docker, with APOC plugin)
+
+Graph Memory requires the **APOC** plugin enabled:
+
+```bash
+mkdir -p ~/Projects/AI/ai-agents/mem0/neo4j/data ~/Projects/AI/ai-agents/mem0/neo4j/plugins
+
+docker run -d \
+  --name neo4j-mem0 \
+  -p 7474:7474 -p 7687:7687 \
+  -v ~/Projects/AI/ai-agents/mem0/neo4j/data:/data \
+  -v ~/Projects/AI/ai-agents/mem0/neo4j/plugins:/plugins \
+  -e NEO4J_AUTH=neo4j/CHANGE_ME_ON_FIRST_BOOT \
+  -e NEO4J_apoc_export_file_enabled=true \
+  -e NEO4J_apoc_import_file_enabled=true \
+  -e NEO4J_apoc_import_file_use__neo4j__config=true \
+  -e NEO4JLABS_PLUGINS='["apoc"]' \
+  --restart always \
+  neo4j:latest
+```
+
+- Port `7474`: Neo4j Browser (`http://localhost:7474`)
+- Port `7687`: Bolt protocol (used by Mem0 to connect)
+- `NEO4J_AUTH` only sets the password on **first boot of an empty data volume**. To change the password later without losing data, log into the Browser and run: `ALTER CURRENT USER SET PASSWORD FROM 'old' TO 'new';`
+
+### 5.3 Ollama models required
+
+```bash
+ollama pull nomic-embed-text
+```
+
+(Reuses an existing chat/reasoning model, e.g. `qwen3:14b`, for entity/fact extraction — no separate pull needed.)
+
+### 5.4 Secrets — `.env`
+
+Create `~/Projects/AI/ai-agents/mem0/.env` (gitignored — see Section 6):
+
+```
+NEO4J_PASSWORD=your_real_password_here
+```
+
+Keep a `.env.example` (no real value, safe to commit) alongside it:
+
+```
+NEO4J_PASSWORD=
+```
+
+### 5.5 `config.py`
+
+```python
+import os
+from dotenv import load_dotenv
+from mem0 import Memory
+
+load_dotenv()
+
+config = {
+    "llm": {
+        "provider": "ollama",
+        "config": {
+            "model": "qwen3:14b",
+            "ollama_base_url": "http://localhost:11434"
+        }
+    },
+    "embedder": {
+        "provider": "ollama",
+        "config": {
+            "model": "nomic-embed-text",
+            "ollama_base_url": "http://localhost:11434"
+        }
+    },
+    "vector_store": {
+        "provider": "qdrant",
+        "config": {
+            "collection_name": "mem0_memories",
+            "embedding_model_dims": 768,
+            "path": "/home/guilherme/Projects/AI/ai-agents/mem0/qdrant_data"
+        }
+    },
+    "graph_store": {
+        "provider": "neo4j",
+        "config": {
+            "url": "bolt://localhost:7687",
+            "username": "neo4j",
+            "password": os.getenv("NEO4J_PASSWORD"),
+            "database": "neo4j"
+        }
+    },
+    "version": "v1.1"
+}
+
+memory = Memory.from_config(config_dict=config)
+```
+
+> `embedding_model_dims: 768` matches `nomic-embed-text`'s output size — Mem0's Qdrant default (1536) is sized for OpenAI embeddings and must be overridden or `add`/`search` will fail with a dimension mismatch.
+
+### 5.6 Test
+
+```python
+# test_mem0.py
+from config import memory
+
+conversation = [
+    {"role": "user", "content": "Uso Ollama local com uma RTX 4080 Super de 16GB."},
+    {"role": "assistant", "content": "Entendido, vou lembrar disso."}
+]
+
+memory.add(conversation, user_id="rizzo")
+
+results = memory.search(
+    "Qual GPU eu uso?",
+    filters={"user_id": "rizzo"},
+    limit=3
+)
+for hit in results["results"]:
+    print(hit["memory"])
+```
+
+```bash
+python test_mem0.py
+```
+
+Verify the graph side by opening `http://localhost:7474` and running `MATCH (n) RETURN n LIMIT 25;` — connected nodes confirm Graph Memory is writing correctly.
+
+> Note: `search()` requires `user_id` inside `filters={}` — passing it as a top-level kwarg (as `add()` still accepts) raises a `ValueError` on current versions.
+
+---
+
+## 6. Git — `~/Projects/AI` repo
+
+`~/Projects/AI` is a git repository. `.gitignore` at its root should include:
+
+```gitignore
+# Python virtual environments
+**/venv*/
+__pycache__/
+*.pyc
+
+# Local databases (data, not source)
+ai-agents/mem0/neo4j/data/
+ai-agents/mem0/neo4j/plugins/
+ai-agents/mem0/qdrant_data/
+
+# Secrets
+.env
+```
+
+---
+
+## Pending / To Investigate
+
+- [ ] **"Coding" agent (remote terminal assistant)** — e.g. Letta's App Server / Letta Code (shell + filesystem access, Telegram/Slack integration). Confirmed free/local capable (no paid plan required for self-hosted runtime). Not yet installed — placeholder for future steps once evaluated.
+- [ ] **CrewAI — RAG/context management** — no native integration available; must be manually delegated to a dedicated tool/agent role within the crew.
+- [ ] **Mem0 — Docker server option (deferred)** — official Docker bundle only supports OpenAI/Anthropic/Gemini out of the box (no native Ollama support). Would require modifying `server/main.py` and rebuilding the image to add Ollama — deferred for now in favor of the venv/library setup in Section 5; revisit if the dashboard/API becomes worth the maintenance overhead of a custom fork.
+- [ ] **Mem0 — optional extras**: `spaCy` (`pip install "mem0ai[nlp]"`) for more refined entity extraction; `fastembed` (`pip install "mem0ai[extras]"`) to enable BM25 keyword search alongside semantic search.
+- [ ] **CrewAI ↔ Mem0 integration** — wire up `config.py`'s `memory` object as a tool/memory source for a CrewAI agent (next step).
+
 ## Notes
 
 - This guide assumes a fresh Ubuntu install on the 500GB partition of the Samsung 990 PRO 2TB.
