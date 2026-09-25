@@ -357,9 +357,14 @@ ai-agents/mem0/neo4j/data/
 ai-agents/mem0/neo4j/plugins/
 ai-agents/mem0/qdrant_data/
 
+# Nested git repo (Paperclip is cloned from its own upstream repo — see Section 8)
+ai-agents/paperclip/
+
 # Secrets
 .env
 ```
+
+> **Nested repo note:** `ai-agents/paperclip/` is itself a git clone of the upstream `paperclipai/paperclip` repo, with its own `.git`. The line above stops the main `~/Projects/AI` repo from tracking it at all. The `.env` inside that folder is additionally covered by the *inner* repo's own `.gitignore` (Section 8.3), in case it's ever committed there directly.
 
 ---
 
@@ -457,6 +462,77 @@ Full script kept alongside this README, in the same folder.
 
 ---
 
+## 8. Paperclip Agent Manager (Docker)
+
+Open-source orchestration platform ([paperclipai/paperclip](https://github.com/paperclipai/paperclip)) that manages a team of AI agents (CrewAI, Claude Code, Codex, etc.) like employees in a company — org chart, tickets, budgets, governance. Will also be used in the future "Get Contractors Now" project.
+
+> **Why Docker and not native (Node/pnpm):** Paperclip doesn't touch the GPU, so the reason Ollama stays native doesn't apply here. Docker was chosen for isolation and portability, matching the Open WebUI approach — the official install path builds the image locally from source (no pre-built image to just pull), so the repo still needs to be cloned either way.
+
+### 8.1 Clone the repo
+
+```bash
+cd ~/Projects/AI/ai-agents
+git clone https://github.com/paperclipai/paperclip.git
+cd paperclip
+```
+
+This creates a **nested git repo** inside `~/Projects/AI` — see the `.gitignore` note in Section 6.
+
+### 8.2 Run via Docker Compose (official quickstart)
+
+```bash
+cd ~/Projects/AI/ai-agents/paperclip
+BETTER_AUTH_SECRET="$(openssl rand -hex 32)" docker compose -f docker/docker-compose.quickstart.yml up -d
+```
+
+- `BETTER_AUTH_SECRET` is required (session/auth signing key) and is only used inline here on first run.
+- First run builds the image from the repo's `Dockerfile` (slower); later runs reuse the built image.
+- Persistent data (embedded PostgreSQL, uploads, secrets key, agent workspace data) lives under `docker/data/docker-paperclip/` inside the repo folder — already covered by the `.gitignore` entry in Section 6.
+- Access at `http://localhost:3100`.
+
+> **Container name:** Compose names it `docker-paperclip-1` (derived from the project folder + service name), **not** `paperclip`. Use the real name for `docker exec`/`docker update` below — check with `docker ps` if unsure.
+
+### 8.3 Persist the secret in `.env`
+
+The `BETTER_AUTH_SECRET` generated above isn't saved anywhere by default. Retrieve it from the running container and persist it:
+
+```bash
+docker exec docker-paperclip-1 env | grep BETTER_AUTH_SECRET
+```
+
+```bash
+cd ~/Projects/AI/ai-agents/paperclip
+echo 'BETTER_AUTH_SECRET=paste_value_here' > .env
+grep -qxF '.env' .gitignore || echo '.env' >> .gitignore
+```
+
+The last line adds `.env` to the *inner* Paperclip repo's own `.gitignore` (belt-and-suspenders alongside the outer repo already ignoring the whole folder — see Section 6). With `.env` in place, future restarts don't need `BETTER_AUTH_SECRET` passed manually:
+
+```bash
+docker compose -f docker/docker-compose.quickstart.yml up -d
+```
+
+### 8.4 Keep it always running (survive reboots)
+
+```bash
+docker update --restart unless-stopped docker-paperclip-1
+```
+
+Matches the Open WebUI behavior: restarts automatically when Docker starts (including after a machine reboot) or after a crash. Only a manual `docker stop docker-paperclip-1` keeps it down.
+
+### 8.5 First login
+
+Open `http://localhost:3100`. The first account created on the setup screen automatically becomes the instance admin — same as Open WebUI (Section 3.6), the email field doesn't need to be real (no SMTP is configured, so nothing is sent/verified). **Done** — admin account created.
+
+### 8.6 Verify
+
+```bash
+docker ps                                   # confirms docker-paperclip-1 is Up
+docker exec docker-paperclip-1 env | grep BETTER_AUTH_SECRET   # matches the .env value
+```
+
+---
+
 ## Pending / To Investigate
 
 - [ ] **"Coding" agent (remote terminal assistant)** — e.g. Letta's App Server / Letta Code (shell + filesystem access, Telegram/Slack integration). Confirmed free/local capable (no paid plan required for self-hosted runtime). Not yet installed — placeholder for future steps once evaluated.
@@ -464,7 +540,9 @@ Full script kept alongside this README, in the same folder.
 - [x] **Mem0 — optional extras** — `spaCy` (`mem0ai[nlp]`) and `fastembed` installed in the CrewAI venv (Section 7.2.1), tested working (models auto-download on first use).
 - [x] **`chromadb`/`posthog` version conflict** (Section 7.4) — resolved by pinning `posthog<6.0.0`; residual `pip check` warning from `mem0ai`'s side confirmed harmless in practice.
 - [ ] **`MEM0_TELEMETRY=false`** (optional, not yet applied) — would remove `mem0ai`'s reliance on `posthog` entirely, eliminating even the theoretical risk noted in 7.4. Low priority since the current setup is already confirmed working.
-- [ ] **Paperclip agent manager** — install and configure; will also be used in the future "Get Contractors Now" project.
+- [x] **Paperclip agent manager** — installed and running via Docker (Section 8); admin account created.
+- [ ] **Hermes agent for CrewAI team management** — set up a Hermes agent to manage/orchestrate a CrewAI team, particularly for the future "Get Contractors Now" project. Not yet investigated — placeholder for future steps.
+- [ ] **MCP (Model Context Protocol) in the AI project** — evaluate and integrate MCP into the stack. Not yet investigated — placeholder for future steps.
 
 ## Notes
 
@@ -474,3 +552,4 @@ Full script kept alongside this README, in the same folder.
 - Ollama is intentionally kept native, not dockerized — see the note at the top of Section 3.
 - Section 3.5 (remote access) is a placeholder until that setup is actually done.
 - Section 7 (CrewAI) runs in its own venv, separate from Mem0's (Section 5) — the two must never have the local Qdrant data open at the same time (see the note in 5.6).
+- Section 8 (Paperclip) is a nested git repo inside `~/Projects/AI` — see the `.gitignore` note in Section 6 before running any `git` commands at the repo root.
