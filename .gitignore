@@ -12,3 +12,4 @@ ai-agents/mem0/qdrant_data/
 # Segredos
 .env
 EOF
+ai-agents/paperclip/
