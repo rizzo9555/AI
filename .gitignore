@@ -13,3 +13,4 @@ ai-agents/mem0/qdrant_data/
 .env
 EOF
 ai-agents/paperclip/
+ai-agents/hermes-agent/
